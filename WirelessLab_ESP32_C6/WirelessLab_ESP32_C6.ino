@@ -1,5 +1,9 @@
 #include <Arduino.h>
 #include <vector>
+
+#if !defined(CONFIG_IDF_TARGET_ESP32C6)
+  #error "This sketch targets ESP32-C6. Select: ESP32C6 Dev Module."
+#endif
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
@@ -19,8 +23,8 @@ extern "C" {
 }
 
 // ============================================================
-// WirelessLab32 v0.4.2
-// Target: ESP32 clásico / ESP32-D0WD-V3
+// WirelessLab32-C6 v0.4.2-c6.1
+// Target: ESP32-C6 / ESP32-C6 Dev Module
 //
 // Wi-Fi:
 // - AP scan
@@ -37,13 +41,13 @@ extern "C" {
 // No almacena información en flash ni SD.
 // ============================================================
 
-static const char *FW_VERSION = "0.4.2";
+static const char *FW_VERSION = "0.4.2-c6.1";
 
 // Credenciales exclusivas del laboratorio.
 static const char *DEMO_USERNAME = "student";
 
 // Nombre BLE fijo para la prueba estable.
-static const char *BLE_DEVICE_NAME = "WirelessLab32";
+static const char *BLE_DEVICE_NAME = "WirelessLab32-C6";
 
 // Servicio BLE de demostración.
 static const char *BLE_SERVICE_UUID =
@@ -274,15 +278,15 @@ public:
     }
 
     if (device.haveManufacturerData()) {
-      std::string manufacturerData =
+      String manufacturerData =
         device.getManufacturerData();
 
       result.manufacturerData =
         bytesToHex(
           reinterpret_cast<const uint8_t *>(
-            manufacturerData.data()
+            manufacturerData.c_str()
           ),
-          manufacturerData.size()
+          manufacturerData.length()
         );
     }
 
@@ -477,16 +481,22 @@ void runBleScan() {
     "Scanning BLE devices for 8 seconds..."
   );
 
-  BLEScanResults results =
+  BLEScanResults *results =
     bleScan->start(
       8,
       false
     );
 
-  Serial.printf(
-    "Raw BLE advertisements found: %d\n",
-    results.getCount()
-  );
+  if (results != nullptr) {
+    Serial.printf(
+      "Raw BLE advertisements found: %d\n",
+      results->getCount()
+    );
+  } else {
+    Serial.println(
+      "BLE scan finished without a results object."
+    );
+  }
 
   Serial.printf(
     "Unique devices stored: %u\n",
@@ -1014,7 +1024,7 @@ void startBeaconLab(
 
   bool started =
     WiFi.softAP(
-      "WirelessLab32-Beacon",
+      "WirelessLab32-C6-Beacon",
       "WirelessLab32!",
       beaconChannel,
       true,
@@ -1388,7 +1398,7 @@ void startPortal(
 
   if (ssid.length() == 0) {
     ssid =
-      "WirelessLab32-Demo";
+      "WirelessLab32-C6-Demo";
   }
 
   WiFi.mode(WIFI_AP);
@@ -1563,7 +1573,7 @@ void handleCommand(
 
   else if (command == "info") {
     Serial.printf(
-      "Firmware: WirelessLab32\n"
+      "Firmware: WirelessLab32-C6\n"
       "Version: %s\n"
       "Chip: %s rev %u\n"
       "CPU: %u MHz\n"
@@ -2014,12 +2024,12 @@ void setup() {
   WiFi.mode(WIFI_OFF);
 
   Serial.println();
-  Serial.println("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
-  Serial.println("X                                 X");
-  Serial.println("X  ESP 32 - Wireless Hacking Lab  X");
-  Serial.println("X                                 X");
-  Serial.println("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
-  Serial.printf("Firmware: WirelessLab32 v%s\n", FW_VERSION);
+  Serial.println("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+  Serial.println("X                                  X");
+  Serial.println("X  ESP32-C6 - Wireless Hacking Lab  X");
+  Serial.println("X                                  X");
+  Serial.println("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+  Serial.printf("Firmware: WirelessLab32-C6 v%s\n", FW_VERSION);
 
   Serial.println(
     "Type: help"
