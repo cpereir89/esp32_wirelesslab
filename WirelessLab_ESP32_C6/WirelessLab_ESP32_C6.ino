@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <new>
 #include <vector>
 
 #if !defined(CONFIG_IDF_TARGET_ESP32C6)
@@ -17,10 +18,25 @@
 #include <BLEService.h>
 #include <BLECharacteristic.h>
 #include <BLE2902.h>
+#include <Zigbee.h>
+#include <ep/ZigbeeAnalog.h>
+
+/*
+  El ESP32-C6 puede exponer más de una consola USB. WirelessLab32 usa
+  explícitamente UART0 para que el banner, los comandos y el log de arranque
+  aparezcan en el mismo puerto que la consola ROM.
+*/
+#define Serial Serial0
 
 extern "C" {
   #include "esp_wifi.h"
+  #include "esp_rom_sys.h"
+  #include "aps/esp_zigbee_aps.h"
 }
+
+#if !defined(ZIGBEE_MODE_ZCZR)
+  #error "Select Zigbee Mode: Zigbee ZCZR (coordinator/router)."
+#endif
 
 // ============================================================
 // WirelessLab32-C6 v0.4.2-c6.1
@@ -41,7 +57,7 @@ extern "C" {
 // No almacena información en flash ni SD.
 // ============================================================
 
-static const char *FW_VERSION = "0.4.2-c6.1";
+static const char *FW_VERSION = "0.4.2-c6.2";
 
 // Credenciales exclusivas del laboratorio.
 static const char *DEMO_USERNAME = "student";
@@ -97,6 +113,13 @@ static const size_t BLE_SPAM_PRESET_COUNT =
 
 static const uint32_t BLE_SPAM_ROTATION_INTERVAL_MS = 3000;
 
+// Zigbee lab: red local, canal fijo y tráfico dummy limitado.
+static const uint8_t ZIGBEE_LAB_CHANNEL = 15;
+static const uint8_t ZIGBEE_LAB_ENDPOINT = 10;
+static const uint16_t ZIGBEE_RX_ON_BROADCAST_ADDRESS = 0xFFFD;
+static const uint8_t MAX_ZIGBEE_LAB_DURATION_SECONDS = 60;
+static const uint32_t ZIGBEE_LAB_INTERVAL_MS = 1000;
+
 // ============================================================
 // Wi-Fi spam lab presets
 // Edita estos nombres para preparar la práctica (máximo 5).
@@ -126,7 +149,8 @@ enum class Mode {
   WIFI_SCAN,
   BEACON_LAB,
   PORTAL,
-  BLE_SERIAL
+  BLE_SERIAL,
+  ZIGBEE_LAB
 };
 
 Mode currentMode = Mode::IDLE;
@@ -195,11 +219,24 @@ bool bleSpamActive = false;
 bool portalRoutesConfigured = false;
 
 // ============================================================
+// Zigbee
+// ============================================================
+
+ZigbeeAnalog *zigbeeLabEndpoint = nullptr;
+
+bool zigbeeStackStarted = false;
+bool zigbeeTrafficActive = false;
+uint32_t zigbeeTrafficStopAt = 0;
+uint32_t zigbeeNextTransmissionAt = 0;
+uint32_t zigbeePacketCounter = 0;
+
+// ============================================================
 // Forward declarations
 // ============================================================
 
 void stopBleOperations();
 void stopAll();
+void stopZigbeeTraffic();
 
 // ============================================================
 // Helpers
@@ -221,9 +258,207 @@ String getModeName() {
 
     case Mode::BLE_SERIAL:
       return "BLE_SERIAL";
+
+    case Mode::ZIGBEE_LAB:
+      return "ZIGBEE_LAB";
   }
 
   return "UNKNOWN";
+}
+
+// ============================================================
+// Zigbee lab
+// ============================================================
+
+void stopZigbeeTraffic() {
+  if (zigbeeTrafficActive) {
+    Serial.println("Zigbee dummy traffic stopped.");
+  }
+
+  zigbeeTrafficActive = false;
+  zigbeeTrafficStopAt = 0;
+}
+
+bool startZigbeeStack() {
+  if (zigbeeStackStarted) {
+    return true;
+  }
+
+  stopAll();
+  WiFi.mode(WIFI_OFF);
+
+  zigbeeLabEndpoint =
+    new (std::nothrow) ZigbeeAnalog(ZIGBEE_LAB_ENDPOINT);
+
+  if (zigbeeLabEndpoint == nullptr) {
+    Serial.println("Not enough memory for the Zigbee lab endpoint.");
+    return false;
+  }
+
+  if (!zigbeeLabEndpoint->addAnalogInput()) {
+    Serial.println("Could not configure the Zigbee lab endpoint.");
+    delete zigbeeLabEndpoint;
+    zigbeeLabEndpoint = nullptr;
+    return false;
+  }
+
+  zigbeeLabEndpoint->setManufacturerAndModel(
+    "WirelessLab32",
+    "ESP32-C6 Dummy Sensor"
+  );
+  zigbeeLabEndpoint->setAnalogInputDescription(
+    "WirelessLab32 dummy counter"
+  );
+  zigbeeLabEndpoint->setAnalogInputMinMax(0.0f, 1000000.0f);
+  zigbeeLabEndpoint->setAnalogInputResolution(1.0f);
+
+  if (!Zigbee.addEndpoint(zigbeeLabEndpoint)) {
+    Serial.println("Could not register the Zigbee lab endpoint.");
+    delete zigbeeLabEndpoint;
+    zigbeeLabEndpoint = nullptr;
+    return false;
+  }
+
+  Zigbee.setPrimaryChannelMask(
+    1UL << ZIGBEE_LAB_CHANNEL
+  );
+  Zigbee.setTimeout(30000);
+
+  Serial.printf(
+    "Starting Zigbee coordinator on channel %u...\n",
+    ZIGBEE_LAB_CHANNEL
+  );
+
+  if (!Zigbee.begin(ZIGBEE_COORDINATOR)) {
+    Serial.println("Could not start the Zigbee network.");
+    return false;
+  }
+
+  Zigbee.openNetwork(0);
+  zigbeeStackStarted = true;
+  currentMode = Mode::ZIGBEE_LAB;
+
+  Serial.println("Zigbee lab network ready.");
+  Serial.printf("Endpoint: %u\n", ZIGBEE_LAB_ENDPOINT);
+  Serial.println(
+    "The Zigbee stack remains active until reboot."
+  );
+
+  return true;
+}
+
+bool sendZigbeeDummyPacket() {
+  /*
+    ZCL Report Attributes:
+      frame control 0x18 (global, server -> client, no response)
+      command 0x0A
+      Analog Input PresentValue (0x0055), type float (0x39)
+  */
+  static uint8_t zclPayload[10];
+  const float dummyValue =
+    static_cast<float>(zigbeePacketCounter);
+
+  zclPayload[0] = 0x18;
+  zclPayload[1] =
+    static_cast<uint8_t>(zigbeePacketCounter);
+  zclPayload[2] = 0x0A;
+  zclPayload[3] = 0x55;
+  zclPayload[4] = 0x00;
+  zclPayload[5] = 0x39;
+  memcpy(&zclPayload[6], &dummyValue, sizeof(dummyValue));
+
+  esp_zb_apsde_data_req_t request = {};
+  request.dst_addr_mode =
+    ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+  request.dst_addr.addr_short =
+    ZIGBEE_RX_ON_BROADCAST_ADDRESS;
+  request.dst_endpoint = ZIGBEE_LAB_ENDPOINT;
+  request.profile_id = ESP_ZB_AF_HA_PROFILE_ID;
+  request.cluster_id =
+    ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT;
+  request.src_endpoint = ZIGBEE_LAB_ENDPOINT;
+  request.asdu_length = sizeof(zclPayload);
+  request.asdu = zclPayload;
+  request.tx_options = 0;
+  request.radius = 1;
+
+  esp_zb_lock_acquire(portMAX_DELAY);
+  const esp_err_t result =
+    esp_zb_aps_data_request(&request);
+  esp_zb_lock_release();
+
+  if (result != ESP_OK) {
+    Serial.printf(
+      "[ZIGBEE] Send error: %s\n",
+      esp_err_to_name(result)
+    );
+    return false;
+  }
+
+  zigbeePacketCounter++;
+  Serial.printf(
+    "[ZIGBEE] Dummy packet #%lu sent on channel %u\n",
+    static_cast<unsigned long>(zigbeePacketCounter),
+    ZIGBEE_LAB_CHANNEL
+  );
+  return true;
+}
+
+void startZigbeeTraffic(uint8_t seconds) {
+  if (
+    seconds == 0 ||
+    seconds > MAX_ZIGBEE_LAB_DURATION_SECONDS
+  ) {
+    seconds = MAX_ZIGBEE_LAB_DURATION_SECONDS;
+  }
+
+  if (!startZigbeeStack()) {
+    return;
+  }
+
+  zigbeePacketCounter = 0;
+  zigbeeTrafficActive = true;
+  zigbeeNextTransmissionAt = millis();
+  zigbeeTrafficStopAt =
+    millis() + static_cast<uint32_t>(seconds) * 1000UL;
+
+  Serial.printf(
+    "Zigbee dummy traffic started for %u seconds.\n",
+    seconds
+  );
+  Serial.printf(
+    "Channel: %u | Interval: %lu ms\n",
+    ZIGBEE_LAB_CHANNEL,
+    static_cast<unsigned long>(ZIGBEE_LAB_INTERVAL_MS)
+  );
+}
+
+void serviceZigbeeTraffic() {
+  if (!zigbeeTrafficActive) {
+    return;
+  }
+
+  const uint32_t now = millis();
+
+  if (
+    zigbeeTrafficStopAt != 0 &&
+    static_cast<int32_t>(now - zigbeeTrafficStopAt) >= 0
+  ) {
+    Serial.println("Zigbee lab timeout reached.");
+    stopZigbeeTraffic();
+    printPrompt();
+    return;
+  }
+
+  if (
+    static_cast<int32_t>(
+      now - zigbeeNextTransmissionAt
+    ) >= 0
+  ) {
+    sendZigbeeDummyPacket();
+    zigbeeNextTransmissionAt =
+      now + ZIGBEE_LAB_INTERVAL_MS;
+  }
 }
 
 void printPrompt() {
@@ -736,6 +971,15 @@ void stopPortal() {
 }
 
 void stopAll() {
+  if (zigbeeStackStarted) {
+    stopZigbeeTraffic();
+    currentMode = Mode::ZIGBEE_LAB;
+    Serial.println(
+      "Zigbee stack remains active. Reboot to release the radio."
+    );
+    return;
+  }
+
   stopPortal();
   stopBleOperations();
 
@@ -1552,6 +1796,21 @@ void printHelp() {
   Serial.println(
     "  ble exit"
   );
+
+  Serial.println();
+  Serial.println("Zigbee (ESP32-C6):");
+  Serial.println(
+    "  zigbee start [seconds]"
+  );
+  Serial.println(
+    "  zigbee send"
+  );
+  Serial.println(
+    "  zigbee stop"
+  );
+  Serial.println(
+    "  zigbee status"
+  );
 }
 
 // ============================================================
@@ -1564,6 +1823,24 @@ void handleCommand(
   command.trim();
 
   if (command.length() == 0) {
+    return;
+  }
+
+  if (
+    zigbeeStackStarted &&
+    command != "help" &&
+    command != "info" &&
+    command != "status" &&
+    command != "stop" &&
+    command != "reboot" &&
+    command != "zigbee send" &&
+    command != "zigbee stop" &&
+    command != "zigbee status" &&
+    !command.startsWith("zigbee start")
+  ) {
+    Serial.println(
+      "Zigbee owns the radio. Reboot before using Wi-Fi or BLE."
+    );
     return;
   }
 
@@ -1595,7 +1872,9 @@ void handleCommand(
       "Mode: %s\n"
       "BLE initialized: %s\n"
       "BLE advertising: %s\n"
-      "Portal: %s\n",
+      "Portal: %s\n"
+      "Zigbee stack: %s\n"
+      "Zigbee traffic: %s\n",
       getModeName().c_str(),
       bleInitialized
         ? "yes"
@@ -1604,6 +1883,12 @@ void handleCommand(
         ? "active"
         : "inactive",
       portalActive
+        ? "active"
+        : "inactive",
+      zigbeeStackStarted
+        ? "active on channel 15"
+        : "inactive",
+      zigbeeTrafficActive
         ? "active"
         : "inactive"
     );
@@ -1620,6 +1905,55 @@ void handleCommand(
 
     delay(150);
     ESP.restart();
+  }
+
+  else if (
+    command.startsWith("zigbee start")
+  ) {
+    String argument =
+      command.substring(
+        String("zigbee start").length()
+      );
+    argument.trim();
+
+    int requestedSeconds =
+      argument.length() ? argument.toInt() : 10;
+
+    if (
+      requestedSeconds <= 0 ||
+      requestedSeconds > MAX_ZIGBEE_LAB_DURATION_SECONDS
+    ) {
+      requestedSeconds = MAX_ZIGBEE_LAB_DURATION_SECONDS;
+    }
+
+    startZigbeeTraffic(
+      static_cast<uint8_t>(requestedSeconds)
+    );
+  }
+
+  else if (command == "zigbee send") {
+    if (!startZigbeeStack()) {
+      return;
+    }
+
+    sendZigbeeDummyPacket();
+  }
+
+  else if (command == "zigbee stop") {
+    stopZigbeeTraffic();
+  }
+
+  else if (command == "zigbee status") {
+    Serial.printf(
+      "Stack: %s\n"
+      "Traffic: %s\n"
+      "Channel: %u\n"
+      "Packets requested: %lu\n",
+      zigbeeStackStarted ? "active" : "inactive",
+      zigbeeTrafficActive ? "active" : "inactive",
+      ZIGBEE_LAB_CHANNEL,
+      static_cast<unsigned long>(zigbeePacketCounter)
+    );
   }
 
   else if (command == "wifi scan") {
@@ -2017,11 +2351,13 @@ void serviceSerial() {
 // ============================================================
 
 void setup() {
+  esp_rom_printf("\n[BOOT] WirelessLab32-C6 entered setup()\n");
+
   Serial.begin(115200);
 
+  esp_rom_printf("[BOOT] Serial initialized; waiting 500 ms\n");
   delay(500);
-
-  WiFi.mode(WIFI_OFF);
+  esp_rom_printf("[BOOT] Printing application banner\n");
 
   Serial.println();
   Serial.println("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
@@ -2042,6 +2378,7 @@ void loop() {
   serviceSerial();
   serviceBeaconLab();
   serviceBleAdvertisingLab();
+  serviceZigbeeTraffic();
 
   if (
     currentMode ==
