@@ -24,6 +24,7 @@ variantes separadas para el ESP32 clásico y el ESP32-C6.
 - Requiere Arduino-ESP32 3.3.8 o posterior.
 - Usa Wi-Fi 6 de 2.4 GHz y Bluetooth Low Energy; el C6 no ofrece Bluetooth
   Classic.
+- Incluye radio IEEE 802.15.4 y un laboratorio Zigbee coordinador en canal 15.
 - La variante incluye los ajustes de API BLE 3.x y una guarda de compilación
   para impedir seleccionar accidentalmente otro SoC.
 - Compilación verificada con Arduino-ESP32 3.3.8 y el toolchain RISC-V oficial.
@@ -67,6 +68,15 @@ PlatformIO está configurado con `espressif32@6.10.0`, `huge_app.csv` y upload a
 
 El firmware no contiene payloads Apple Continuity, Fast Pair, AirPods ni otros
 paquetes diseñados para provocar pop-ups no solicitados.
+
+### Zigbee (solo ESP32-C6)
+
+- Crea una red Zigbee de laboratorio como coordinador en el canal fijo 15.
+- Publica reportes ZCL válidos de una entrada analógica ficticia una vez por
+  segundo, útiles para practicar captura y análisis.
+- Cada ejecución dura como máximo 60 segundos y puede detenerse antes.
+- Los paquetes se envían por broadcast a dispositivos con el receptor activo;
+  no controlan dispositivos ni intentan unirse a redes ajenas.
 
 ## Compilación con Arduino IDE
 
@@ -113,7 +123,8 @@ por ahora Arduino IDE con el core oficial 3.3.8 o posterior.
    ```text
    Board: ESP32C6 Dev Module
    Flash Size: 4 MB
-   Partition Scheme: Huge APP
+   Partition Scheme: Custom
+   Zigbee Mode: Zigbee ZCZR (coordinator/router)
    USB CDC On Boot: Enabled
    Upload Speed: 460800
    Monitor Speed: 115200
@@ -121,11 +132,15 @@ por ahora Arduino IDE con el core oficial 3.3.8 o posterior.
 
 4. Compila y carga el sketch.
 
-Tamaño verificado con core 3.3.8:
+El sketch incluye `WirelessLab_ESP32_C6/partitions.csv`: una tabla local para
+flash de 4 MB con una aplicación grande y las particiones de almacenamiento
+Zigbee. No incluye OTA.
+
+Tamaño verificado con core 3.3.8 y Zigbee habilitado:
 
 ```text
-Programa: 1,425,944 bytes (45%)
-RAM global: 45,296 bytes (13%)
+Programa: 1,814,138 bytes
+RAM global: 64,280 bytes (19%)
 ```
 
 ## Comandos
@@ -141,7 +156,8 @@ reboot
 ```
 
 `stop` detiene el portal, beacon lab, escaneo y advertising activos, y regresa a
-modo `IDLE`.
+modo `IDLE`. Después de iniciar Zigbee, `stop` detiene los reportes dummy, pero
+la pila Zigbee conserva la radio hasta ejecutar `reboot`.
 
 ### Wi-Fi
 
@@ -194,6 +210,27 @@ ble bluejack demo
 ble bluejack send <message>
 ble exit
 ```
+
+### Zigbee (ESP32-C6)
+
+```text
+zigbee start [seconds]
+zigbee send
+zigbee status
+zigbee stop
+```
+
+Ejemplo para generar 30 reportes dummy en el canal 15:
+
+```text
+zigbee start 30
+zigbee status
+zigbee stop
+```
+
+`zigbee send` solicita un solo reporte. La primera orden Zigbee crea la red y
+puede tardar varios segundos. Una vez iniciada la pila, reinicia el C6 antes de
+volver a utilizar los módulos Wi-Fi o BLE.
 
 ## Primera prueba BLE
 
