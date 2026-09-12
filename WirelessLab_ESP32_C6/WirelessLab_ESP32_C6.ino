@@ -1,4 +1,6 @@
 #include <Arduino.h>
+#include <cerrno>
+#include <cmath>
 #include <new>
 #include <vector>
 
@@ -19,7 +21,8 @@
 #include <BLECharacteristic.h>
 #include <BLE2902.h>
 #include <Zigbee.h>
-#include <ep/ZigbeeAnalog.h>
+#include <ep/ZigbeeLight.h>
+#include <ep/ZigbeeTempSensor.h>
 
 /*
   El ESP32-C6 puede exponer más de una consola USB. WirelessLab32 usa
@@ -29,13 +32,19 @@
 #define Serial Serial0
 
 extern "C" {
+  #include "esp_partition.h"
   #include "esp_wifi.h"
   #include "esp_rom_sys.h"
-  #include "aps/esp_zigbee_aps.h"
+  #include "bdb/esp_zigbee_bdb_commissioning.h"
 }
 
-#if !defined(ZIGBEE_MODE_ZCZR)
-  #error "Select Zigbee Mode: Zigbee ZCZR (coordinator/router)."
+#if !defined(ZIGBEE_MODE_ED)
+  #error "Select Zigbee Mode: Zigbee ED (end device)."
+#endif
+
+// Arduino.h defines SERIAL as a numeric macro; free the name for the enum below.
+#ifdef SERIAL
+  #undef SERIAL
 #endif
 
 // ============================================================
@@ -57,7 +66,7 @@ extern "C" {
 // No almacena información en flash ni SD.
 // ============================================================
 
-static const char *FW_VERSION = "0.4.2-c6.2";
+static const char *FW_VERSION = "0.5.0-c6-ed";
 
 // Credenciales exclusivas del laboratorio.
 static const char *DEMO_USERNAME = "student";
@@ -113,12 +122,25 @@ static const size_t BLE_SPAM_PRESET_COUNT =
 
 static const uint32_t BLE_SPAM_ROTATION_INTERVAL_MS = 3000;
 
-// Zigbee lab: red local, canal fijo y tráfico dummy limitado.
-static const uint8_t ZIGBEE_LAB_CHANNEL = 15;
-static const uint8_t ZIGBEE_LAB_ENDPOINT = 10;
-static const uint16_t ZIGBEE_RX_ON_BROADCAST_ADDRESS = 0xFFFD;
-static const uint8_t MAX_ZIGBEE_LAB_DURATION_SECONDS = 60;
-static const uint32_t ZIGBEE_LAB_INTERVAL_MS = 1000;
+// Zigbee End Device lab for Home Assistant ZHA.
+static const uint8_t ZIGBEE_ENDPOINT = 10;
+static const char *ZIGBEE_MANUFACTURER = "WirelessLab32";
+static const char *ZIGBEE_LIGHT_MODEL = "ESP32-C6 Lab Light";
+static const char *ZIGBEE_SENSOR_MODEL = "ESP32-C6 Lab Sensor";
+static const uint8_t MAX_ZIGBEE_REPORTING_DURATION_SECONDS = 60;
+static const uint32_t ZIGBEE_SENSOR_DEFAULT_INTERVAL_MS = 5000;
+static const uint32_t ZIGBEE_SENSOR_MIN_INTERVAL_MS = 500;
+static const uint32_t ZIGBEE_SENSOR_MAX_INTERVAL_MS = 60000;
+static const uint32_t ZIGBEE_FACTORY_RESET_CONFIRMATION_MS = 15000;
+
+#ifndef LED_BUILTIN
+static const uint8_t ZIGBEE_LIGHT_LED_PIN = 8;
+#else
+static const uint8_t ZIGBEE_LIGHT_LED_PIN = LED_BUILTIN;
+#endif
+
+// Cambia a true si el LED de tu placa se enciende con nivel LOW.
+static const bool ZIGBEE_LIGHT_LED_ACTIVE_LOW = false;
 
 // ============================================================
 // Wi-Fi spam lab presets
@@ -150,7 +172,18 @@ enum class Mode {
   BEACON_LAB,
   PORTAL,
   BLE_SERIAL,
-  ZIGBEE_LAB
+  ZIGBEE_DEVICE
+};
+
+enum class ZigbeeProfile {
+  SENSOR,
+  LIGHT
+};
+
+enum class ZigbeeLightStateSource {
+  STARTUP,
+  SERIAL,
+  REMOTE
 };
 
 Mode currentMode = Mode::IDLE;
@@ -222,13 +255,32 @@ bool portalRoutesConfigured = false;
 // Zigbee
 // ============================================================
 
-ZigbeeAnalog *zigbeeLabEndpoint = nullptr;
-
+ZigbeeProfile zigbeeProfile = ZigbeeProfile::SENSOR;
+ZigbeeLight *zigbeeLightEndpoint = nullptr;
+ZigbeeTempSensor *zigbeeSensorEndpoint = nullptr;
 bool zigbeeStackStarted = false;
-bool zigbeeTrafficActive = false;
-uint32_t zigbeeTrafficStopAt = 0;
-uint32_t zigbeeNextTransmissionAt = 0;
-uint32_t zigbeePacketCounter = 0;
+bool zigbeeJoined = false;
+bool zigbeeJoining = false;
+bool zigbeeEndpointReady = false;
+bool zigbeeRebootRequired = false;
+bool zigbeeFactoryResetPending = false;
+uint32_t zigbeeFactoryResetDeadline = 0;
+String zigbeeLastOperation = "none";
+esp_err_t zigbeeLastResult = ESP_OK;
+bool zigbeeHasLastResult = false;
+
+bool zigbeeLightState = false;
+bool zigbeeLocalLightUpdate = false;
+ZigbeeLightStateSource zigbeeLightStateSource =
+  ZigbeeLightStateSource::STARTUP;
+
+int16_t zigbeeSensorCentiCelsius = 2350;
+uint32_t zigbeeSensorIntervalMs =
+  ZIGBEE_SENSOR_DEFAULT_INTERVAL_MS;
+bool zigbeeSensorReportingActive = false;
+uint32_t zigbeeSensorReportingStopAt = 0;
+uint32_t zigbeeSensorNextReportAt = 0;
+uint32_t zigbeeSensorReportsSent = 0;
 
 // ============================================================
 // Forward declarations
@@ -236,7 +288,9 @@ uint32_t zigbeePacketCounter = 0;
 
 void stopBleOperations();
 void stopAll();
-void stopZigbeeTraffic();
+void stopSensorReporting(bool announce = true);
+void printZigbeeStatus();
+void serviceZigbee();
 
 // ============================================================
 // Helpers
@@ -259,206 +313,769 @@ String getModeName() {
     case Mode::BLE_SERIAL:
       return "BLE_SERIAL";
 
-    case Mode::ZIGBEE_LAB:
-      return "ZIGBEE_LAB";
+    case Mode::ZIGBEE_DEVICE:
+      return "ZIGBEE_DEVICE";
   }
 
   return "UNKNOWN";
 }
 
 // ============================================================
-// Zigbee lab
+// Zigbee End Device lab
 // ============================================================
 
-void stopZigbeeTraffic() {
-  if (zigbeeTrafficActive) {
-    Serial.println("Zigbee dummy traffic stopped.");
-  }
-
-  zigbeeTrafficActive = false;
-  zigbeeTrafficStopAt = 0;
+const char *getZigbeeProfileName() {
+  return zigbeeProfile == ZigbeeProfile::LIGHT
+    ? "LIGHT"
+    : "SENSOR";
 }
 
-bool startZigbeeStack() {
+const char *getZigbeeModelName() {
+  return zigbeeProfile == ZigbeeProfile::LIGHT
+    ? ZIGBEE_LIGHT_MODEL
+    : ZIGBEE_SENSOR_MODEL;
+}
+
+const char *getLightStateSourceName() {
+  switch (zigbeeLightStateSource) {
+    case ZigbeeLightStateSource::SERIAL:
+      return "serial";
+    case ZigbeeLightStateSource::REMOTE:
+      return "remote";
+    case ZigbeeLightStateSource::STARTUP:
+    default:
+      return "startup";
+  }
+}
+
+void setZigbeeResult(
+  const String &operation,
+  esp_err_t result
+) {
+  zigbeeLastOperation = operation;
+  zigbeeLastResult = result;
+  zigbeeHasLastResult = true;
+}
+
+bool parseStrictLong(
+  String value,
+  long &parsed
+) {
+  value.trim();
+
+  if (value.length() == 0) {
+    return false;
+  }
+
+  errno = 0;
+  char *end = nullptr;
+  const long result =
+    strtol(value.c_str(), &end, 10);
+
+  if (
+    errno == ERANGE ||
+    end == value.c_str() ||
+    *end != '\0'
+  ) {
+    return false;
+  }
+
+  parsed = result;
+  return true;
+}
+
+bool parseStrictFloat(
+  String value,
+  float &parsed
+) {
+  value.trim();
+
+  if (value.length() == 0) {
+    return false;
+  }
+
+  errno = 0;
+  char *end = nullptr;
+  const float result =
+    strtof(value.c_str(), &end);
+
+  if (
+    errno == ERANGE ||
+    end == value.c_str() ||
+    *end != '\0' ||
+    !isfinite(result)
+  ) {
+    return false;
+  }
+
+  parsed = result;
+  return true;
+}
+
+String normalizeCommandWhitespace(String value) {
+  value.trim();
+  String normalized;
+  normalized.reserve(value.length());
+  bool previousWasSpace = false;
+
+  for (size_t i = 0; i < value.length(); i++) {
+    const char character = value.charAt(i);
+    const bool isSpace =
+      character == ' ' || character == '\t';
+
+    if (isSpace) {
+      if (!previousWasSpace) {
+        normalized += ' ';
+      }
+    } else {
+      normalized += character;
+    }
+
+    previousWasSpace = isSpace;
+  }
+
+  normalized.trim();
+  return normalized;
+}
+
+void applyLightLedState(bool on) {
+  const uint8_t level =
+    (on != ZIGBEE_LIGHT_LED_ACTIVE_LOW)
+      ? HIGH
+      : LOW;
+
+  digitalWrite(ZIGBEE_LIGHT_LED_PIN, level);
+}
+
+void printLightState(
+  bool state,
+  ZigbeeLightStateSource source
+) {
+  Serial.println();
+  Serial.println("[ZIGBEE LIGHT]");
+  Serial.printf("state=%s\n", state ? "ON" : "OFF");
+
+  switch (source) {
+    case ZigbeeLightStateSource::SERIAL:
+      Serial.println("source=serial");
+      break;
+    case ZigbeeLightStateSource::REMOTE:
+      Serial.println("source=remote");
+      break;
+    case ZigbeeLightStateSource::STARTUP:
+    default:
+      Serial.println("source=startup");
+      break;
+  }
+}
+
+void handleRemoteLightChange(bool state) {
+  zigbeeLightState = state;
+  zigbeeLightStateSource =
+    zigbeeLocalLightUpdate
+      ? ZigbeeLightStateSource::SERIAL
+      : ZigbeeLightStateSource::REMOTE;
+
+  applyLightLedState(state);
+  printLightState(state, zigbeeLightStateSource);
+}
+
+bool initializeZigbeeLightEndpoint() {
+  if (zigbeeLightEndpoint != nullptr) {
+    return false;
+  }
+
+  zigbeeLightEndpoint =
+    new (std::nothrow) ZigbeeLight(ZIGBEE_ENDPOINT);
+
+  if (zigbeeLightEndpoint == nullptr) {
+    setZigbeeResult("create light endpoint", ESP_ERR_NO_MEM);
+    return false;
+  }
+
+  if (
+    !zigbeeLightEndpoint->setManufacturerAndModel(
+      ZIGBEE_MANUFACTURER,
+      ZIGBEE_LIGHT_MODEL
+    )
+  ) {
+    setZigbeeResult("configure light endpoint", ESP_FAIL);
+    return false;
+  }
+
+  zigbeeLightEndpoint->onLightChange(
+    handleRemoteLightChange
+  );
+
+  if (!Zigbee.addEndpoint(zigbeeLightEndpoint)) {
+    setZigbeeResult("register light endpoint", ESP_FAIL);
+    return false;
+  }
+
+  return true;
+}
+
+bool initializeZigbeeSensorEndpoint() {
+  if (zigbeeSensorEndpoint != nullptr) {
+    return false;
+  }
+
+  zigbeeSensorEndpoint =
+    new (std::nothrow) ZigbeeTempSensor(ZIGBEE_ENDPOINT);
+
+  if (zigbeeSensorEndpoint == nullptr) {
+    setZigbeeResult("create sensor endpoint", ESP_ERR_NO_MEM);
+    return false;
+  }
+
+  if (
+    !zigbeeSensorEndpoint->setManufacturerAndModel(
+      ZIGBEE_MANUFACTURER,
+      ZIGBEE_SENSOR_MODEL
+    ) ||
+    !zigbeeSensorEndpoint->setMinMaxValue(-40.0f, 125.0f) ||
+    !zigbeeSensorEndpoint->setDefaultValue(
+      zigbeeSensorCentiCelsius / 100.0f
+    ) ||
+    !zigbeeSensorEndpoint->setTolerance(0.01f)
+  ) {
+    setZigbeeResult("configure sensor endpoint", ESP_FAIL);
+    return false;
+  }
+
+  if (!Zigbee.addEndpoint(zigbeeSensorEndpoint)) {
+    setZigbeeResult("register sensor endpoint", ESP_FAIL);
+    return false;
+  }
+
+  return true;
+}
+
+bool initializeSelectedZigbeeEndpoint() {
+  if (zigbeeEndpointReady) {
+    return true;
+  }
+
+  const bool ready =
+    zigbeeProfile == ZigbeeProfile::LIGHT
+      ? initializeZigbeeLightEndpoint()
+      : initializeZigbeeSensorEndpoint();
+
+  zigbeeEndpointReady = ready;
+  return ready;
+}
+
+bool startZigbeeEndDevice() {
   if (zigbeeStackStarted) {
+    Serial.println(
+      zigbeeJoined
+        ? "Zigbee device is already joined."
+        : "Zigbee network steering is already active."
+    );
     return true;
   }
 
   stopAll();
   WiFi.mode(WIFI_OFF);
 
-  zigbeeLabEndpoint =
-    new (std::nothrow) ZigbeeAnalog(ZIGBEE_LAB_ENDPOINT);
+  if (bleInitialized) {
+    BLEDevice::deinit(true);
+    bleScan = nullptr;
+    bleAdvertising = nullptr;
+    bleServer = nullptr;
+    bleService = nullptr;
+    bleBluejackMessage = nullptr;
 
-  if (zigbeeLabEndpoint == nullptr) {
-    Serial.println("Not enough memory for the Zigbee lab endpoint.");
+    for (size_t i = 0; i < 3; i++) {
+      bleDemoContacts[i] = nullptr;
+    }
+
+    bleInitialized = false;
+    Serial.println("BLE stack released for Zigbee.");
+  }
+
+  if (!initializeSelectedZigbeeEndpoint()) {
+    Serial.printf(
+      "Could not create the %s endpoint.\n",
+      getZigbeeProfileName()
+    );
     return false;
   }
 
-  if (!zigbeeLabEndpoint->addAnalogInput()) {
-    Serial.println("Could not configure the Zigbee lab endpoint.");
-    delete zigbeeLabEndpoint;
-    zigbeeLabEndpoint = nullptr;
-    return false;
-  }
-
-  zigbeeLabEndpoint->setManufacturerAndModel(
-    "WirelessLab32",
-    "ESP32-C6 Dummy Sensor"
-  );
-  zigbeeLabEndpoint->setAnalogInputDescription(
-    "WirelessLab32 dummy counter"
-  );
-  zigbeeLabEndpoint->setAnalogInputMinMax(0.0f, 1000000.0f);
-  zigbeeLabEndpoint->setAnalogInputResolution(1.0f);
-
-  if (!Zigbee.addEndpoint(zigbeeLabEndpoint)) {
-    Serial.println("Could not register the Zigbee lab endpoint.");
-    delete zigbeeLabEndpoint;
-    zigbeeLabEndpoint = nullptr;
-    return false;
-  }
-
-  Zigbee.setPrimaryChannelMask(
-    1UL << ZIGBEE_LAB_CHANNEL
-  );
   Zigbee.setTimeout(30000);
 
+  Serial.println("Starting Zigbee End Device...");
   Serial.printf(
-    "Starting Zigbee coordinator on channel %u...\n",
-    ZIGBEE_LAB_CHANNEL
+    "Selected profile: %s\n",
+    getZigbeeProfileName()
+  );
+  Serial.println("Searching for an open Zigbee network...");
+  Serial.println(
+    "Use Home Assistant ZHA > Add device to open permit-join."
   );
 
-  if (!Zigbee.begin(ZIGBEE_COORDINATOR)) {
-    Serial.println("Could not start the Zigbee network.");
+  zigbeeJoining = true;
+  zigbeeLastOperation = "network steering";
+
+  if (!Zigbee.begin(ZIGBEE_END_DEVICE)) {
+    zigbeeJoining = false;
+    setZigbeeResult("start Zigbee End Device", ESP_FAIL);
+    Serial.println("Could not start the Zigbee End Device stack.");
     return false;
   }
 
-  Zigbee.openNetwork(0);
   zigbeeStackStarted = true;
-  currentMode = Mode::ZIGBEE_LAB;
+  currentMode = Mode::ZIGBEE_DEVICE;
+  setZigbeeResult("start Zigbee End Device", ESP_OK);
 
-  Serial.println("Zigbee lab network ready.");
-  Serial.printf("Endpoint: %u\n", ZIGBEE_LAB_ENDPOINT);
   Serial.println(
-    "The Zigbee stack remains active until reboot."
+    "Zigbee stack started; waiting for a confirmed network join."
   );
-
+  Serial.println(
+    "The radio remains assigned to Zigbee until reboot."
+  );
   return true;
 }
 
-bool sendZigbeeDummyPacket() {
-  /*
-    ZCL Report Attributes:
-      frame control 0x18 (global, server -> client, no response)
-      command 0x0A
-      Analog Input PresentValue (0x0055), type float (0x39)
-  */
-  static uint8_t zclPayload[10];
-  const float dummyValue =
-    static_cast<float>(zigbeePacketCounter);
+void announceZigbeeJoined() {
+  esp_zb_ieee_addr_t extendedPanId = {};
+  esp_zb_get_extended_pan_id(extendedPanId);
 
-  zclPayload[0] = 0x18;
-  zclPayload[1] =
-    static_cast<uint8_t>(zigbeePacketCounter);
-  zclPayload[2] = 0x0A;
-  zclPayload[3] = 0x55;
-  zclPayload[4] = 0x00;
-  zclPayload[5] = 0x39;
-  memcpy(&zclPayload[6], &dummyValue, sizeof(dummyValue));
+  Serial.println();
+  Serial.println("Zigbee device joined.");
+  Serial.printf(
+    "Channel: %u\n"
+    "PAN ID: 0x%04X\n"
+    "Short address: 0x%04X\n"
+    "Coordinator: 0x0000\n"
+    "Profile: %s\n",
+    esp_zb_get_current_channel(),
+    esp_zb_get_pan_id(),
+    esp_zb_get_short_address(),
+    getZigbeeProfileName()
+  );
 
-  esp_zb_apsde_data_req_t request = {};
-  request.dst_addr_mode =
-    ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
-  request.dst_addr.addr_short =
-    ZIGBEE_RX_ON_BROADCAST_ADDRESS;
-  request.dst_endpoint = ZIGBEE_LAB_ENDPOINT;
-  request.profile_id = ESP_ZB_AF_HA_PROFILE_ID;
-  request.cluster_id =
-    ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT;
-  request.src_endpoint = ZIGBEE_LAB_ENDPOINT;
-  request.asdu_length = sizeof(zclPayload);
-  request.asdu = zclPayload;
-  request.tx_options = 0;
-  request.radius = 1;
+  zigbeeJoined = true;
+  zigbeeJoining = false;
+  setZigbeeResult("join network", ESP_OK);
+
+  if (
+    zigbeeProfile == ZigbeeProfile::SENSOR &&
+    zigbeeSensorEndpoint != nullptr
+  ) {
+    zigbeeSensorEndpoint->setTemperature(
+      zigbeeSensorCentiCelsius / 100.0f
+    );
+  }
+}
+
+void handleZigbeeJoin() {
+  if (zigbeeRebootRequired) {
+    Serial.println(
+      "Reboot is required before starting Zigbee again."
+    );
+    return;
+  }
+
+  startZigbeeEndDevice();
+}
+
+bool reportLightState() {
+  if (
+    !zigbeeJoined ||
+    zigbeeLightEndpoint == nullptr
+  ) {
+    Serial.println("Light state changed locally; device is not joined.");
+    return false;
+  }
+
+  esp_zb_zcl_report_attr_cmd_t report = {};
+  report.address_mode =
+    ESP_ZB_APS_ADDR_MODE_DST_ADDR_ENDP_NOT_PRESENT;
+  report.attributeID = ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID;
+  report.direction = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI;
+  report.clusterID = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF;
+  report.zcl_basic_cmd.src_endpoint = ZIGBEE_ENDPOINT;
+  report.manuf_specific = 0;
+  report.dis_default_resp = 0;
 
   esp_zb_lock_acquire(portMAX_DELAY);
   const esp_err_t result =
-    esp_zb_aps_data_request(&request);
+    esp_zb_zcl_report_attr_cmd_req(&report);
   esp_zb_lock_release();
+
+  setZigbeeResult("report light state", result);
 
   if (result != ESP_OK) {
     Serial.printf(
-      "[ZIGBEE] Send error: %s\n",
+      "Could not report light state: %s\n",
       esp_err_to_name(result)
     );
     return false;
   }
 
-  zigbeePacketCounter++;
+  return true;
+}
+
+void setZigbeeLightState(
+  bool state,
+  ZigbeeLightStateSource source
+) {
+  zigbeeLightState = state;
+  zigbeeLightStateSource = source;
+  applyLightLedState(state);
+
+  if (zigbeeLightEndpoint != nullptr) {
+    zigbeeLocalLightUpdate = true;
+    const bool updated =
+      zigbeeLightEndpoint->setLight(state);
+    zigbeeLocalLightUpdate = false;
+    setZigbeeResult(
+      "set light state",
+      updated ? ESP_OK : ESP_FAIL
+    );
+
+    if (updated && zigbeeJoined) {
+      reportLightState();
+    }
+  } else {
+    printLightState(state, source);
+  }
+
+  if (!zigbeeJoined) {
+    Serial.println(
+      "Light state changed locally; device is not joined."
+    );
+  }
+}
+
+bool sendSensorReport() {
+  if (zigbeeProfile != ZigbeeProfile::SENSOR) {
+    Serial.println(
+      "Zigbee SENSOR command rejected: selected profile is LIGHT."
+    );
+    return false;
+  }
+
+  if (
+    !zigbeeJoined ||
+    zigbeeSensorEndpoint == nullptr
+  ) {
+    Serial.println(
+      "Cannot send sensor report: Zigbee device is not joined."
+    );
+    return false;
+  }
+
+  const float temperature =
+    zigbeeSensorCentiCelsius / 100.0f;
+
+  if (
+    !zigbeeSensorEndpoint->setTemperature(temperature) ||
+    !zigbeeSensorEndpoint->reportTemperature()
+  ) {
+    setZigbeeResult("send temperature report", ESP_FAIL);
+    Serial.println("Temperature report failed.");
+    return false;
+  }
+
+  zigbeeSensorReportsSent++;
+  setZigbeeResult("send temperature report", ESP_OK);
   Serial.printf(
-    "[ZIGBEE] Dummy packet #%lu sent on channel %u\n",
-    static_cast<unsigned long>(zigbeePacketCounter),
-    ZIGBEE_LAB_CHANNEL
+    "[ZIGBEE SENSOR] %.2f C report #%lu sent.\n",
+    temperature,
+    static_cast<unsigned long>(zigbeeSensorReportsSent)
   );
   return true;
 }
 
-void startZigbeeTraffic(uint8_t seconds) {
-  if (
-    seconds == 0 ||
-    seconds > MAX_ZIGBEE_LAB_DURATION_SECONDS
-  ) {
-    seconds = MAX_ZIGBEE_LAB_DURATION_SECONDS;
+void stopSensorReporting(bool announce) {
+  if (zigbeeSensorReportingActive && announce) {
+    Serial.println("Automatic sensor reporting stopped.");
   }
 
-  if (!startZigbeeStack()) {
+  zigbeeSensorReportingActive = false;
+  zigbeeSensorReportingStopAt = 0;
+  zigbeeSensorNextReportAt = 0;
+}
+
+void startSensorReporting(uint8_t seconds) {
+  if (zigbeeProfile != ZigbeeProfile::SENSOR) {
+    Serial.println(
+      "Zigbee SENSOR command rejected: selected profile is LIGHT."
+    );
     return;
   }
 
-  zigbeePacketCounter = 0;
-  zigbeeTrafficActive = true;
-  zigbeeNextTransmissionAt = millis();
-  zigbeeTrafficStopAt =
+  if (!zigbeeJoined) {
+    Serial.println(
+      "Cannot start sensor reporting: Zigbee device is not joined."
+    );
+    return;
+  }
+
+  zigbeeSensorReportingActive = true;
+  zigbeeSensorReportingStopAt =
     millis() + static_cast<uint32_t>(seconds) * 1000UL;
+  zigbeeSensorNextReportAt = millis();
 
   Serial.printf(
-    "Zigbee dummy traffic started for %u seconds.\n",
+    "Automatic sensor reporting started for %u seconds.\n",
     seconds
-  );
-  Serial.printf(
-    "Channel: %u | Interval: %lu ms\n",
-    ZIGBEE_LAB_CHANNEL,
-    static_cast<unsigned long>(ZIGBEE_LAB_INTERVAL_MS)
   );
 }
 
-void serviceZigbeeTraffic() {
-  if (!zigbeeTrafficActive) {
+void serviceSensorReporting() {
+  if (!zigbeeSensorReportingActive) {
     return;
   }
 
   const uint32_t now = millis();
 
   if (
-    zigbeeTrafficStopAt != 0 &&
-    static_cast<int32_t>(now - zigbeeTrafficStopAt) >= 0
+    static_cast<int32_t>(
+      now - zigbeeSensorReportingStopAt
+    ) >= 0
   ) {
-    Serial.println("Zigbee lab timeout reached.");
-    stopZigbeeTraffic();
+    Serial.println("Sensor reporting duration completed.");
+    stopSensorReporting(false);
     printPrompt();
     return;
   }
 
   if (
     static_cast<int32_t>(
-      now - zigbeeNextTransmissionAt
+      now - zigbeeSensorNextReportAt
     ) >= 0
   ) {
-    sendZigbeeDummyPacket();
-    zigbeeNextTransmissionAt =
-      now + ZIGBEE_LAB_INTERVAL_MS;
+    sendSensorReport();
+    zigbeeSensorNextReportAt =
+      now + zigbeeSensorIntervalMs;
   }
+}
+
+void requestZigbeeLeave() {
+  if (!zigbeeStackStarted || !zigbeeJoined) {
+    Serial.println("Zigbee device is not joined.");
+    return;
+  }
+
+  stopSensorReporting(false);
+  zigbeeLastOperation = "leave network";
+  Serial.println(
+    "Requesting local Zigbee leave and clearing Zigbee network state..."
+  );
+  Serial.println(
+    "The Arduino Zigbee core may reboot automatically after leave completes."
+  );
+
+  esp_zb_bdb_reset_via_local_action();
+}
+
+void requestZigbeeFactoryReset() {
+  esp_err_t result = ESP_OK;
+
+  if (zigbeeStackStarted) {
+    Zigbee.factoryReset(false);
+  } else {
+    const esp_partition_t *partition =
+      esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA,
+        ESP_PARTITION_SUBTYPE_ANY,
+        "zb_storage"
+      );
+
+    if (partition == nullptr) {
+      result = ESP_ERR_NOT_FOUND;
+    } else {
+      result = esp_partition_erase_range(
+        partition,
+        0,
+        partition->size
+      );
+    }
+  }
+
+  zigbeeFactoryResetPending = false;
+  zigbeeFactoryResetDeadline = 0;
+  setZigbeeResult("factory reset Zigbee storage", result);
+
+  if (result == ESP_OK) {
+    stopSensorReporting(false);
+    zigbeeJoined = false;
+    zigbeeJoining = false;
+    zigbeeRebootRequired = true;
+    Serial.println("Zigbee factory state cleared.");
+    Serial.println("Reboot required. Use: reboot");
+  } else {
+    Serial.printf(
+      "Zigbee factory reset failed: %s\n",
+      esp_err_to_name(result)
+    );
+  }
+}
+
+void printSensorStatus() {
+  uint32_t remainingSeconds = 0;
+
+  if (
+    zigbeeSensorReportingActive &&
+    static_cast<int32_t>(
+      zigbeeSensorReportingStopAt - millis()
+    ) > 0
+  ) {
+    remainingSeconds =
+      (zigbeeSensorReportingStopAt - millis() + 999) / 1000;
+  }
+
+  Serial.printf(
+    "Sensor value: %.2f C\n"
+    "Report interval: %lu ms\n"
+    "Automatic reporting: %s\n"
+    "Reports sent: %lu\n",
+    zigbeeSensorCentiCelsius / 100.0f,
+    static_cast<unsigned long>(zigbeeSensorIntervalMs),
+    zigbeeSensorReportingActive ? "active" : "inactive",
+    static_cast<unsigned long>(zigbeeSensorReportsSent)
+  );
+
+  if (zigbeeSensorReportingActive) {
+    Serial.printf(
+      "Traffic stop in: %lu s\n",
+      static_cast<unsigned long>(remainingSeconds)
+    );
+  } else {
+    Serial.println("Traffic stop in: inactive");
+  }
+}
+
+void printZigbeeStatus() {
+  Serial.println();
+  Serial.println("Zigbee status");
+  Serial.println("-------------");
+  Serial.printf("Profile: %s\n", getZigbeeProfileName());
+  Serial.println("Role: End Device");
+  Serial.printf(
+    "Stack started: %s\n"
+    "Endpoint ready: %s\n"
+    "Joined: %s\n"
+    "Joining: %s\n",
+    zigbeeStackStarted ? "yes" : "no",
+    zigbeeEndpointReady ? "yes" : "no",
+    zigbeeJoined ? "yes" : "no",
+    zigbeeJoining ? "yes" : "no"
+  );
+
+  if (zigbeeJoined) {
+    esp_zb_ieee_addr_t extendedPanId = {};
+    esp_zb_get_extended_pan_id(extendedPanId);
+
+    Serial.printf(
+      "Channel: %u\n"
+      "PAN ID: 0x%04X\n"
+      "Extended PAN ID: "
+      "%02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X\n"
+      "Short address: 0x%04X\n"
+      "Coordinator address: 0x0000\n",
+      esp_zb_get_current_channel(),
+      esp_zb_get_pan_id(),
+      extendedPanId[7],
+      extendedPanId[6],
+      extendedPanId[5],
+      extendedPanId[4],
+      extendedPanId[3],
+      extendedPanId[2],
+      extendedPanId[1],
+      extendedPanId[0],
+      esp_zb_get_short_address()
+    );
+  } else {
+    Serial.println("Channel: unknown");
+    Serial.println("PAN ID: unknown");
+    Serial.println("Extended PAN ID: unknown");
+    Serial.println("Short address: unknown");
+    Serial.println("Coordinator address: unknown");
+  }
+
+  Serial.printf(
+    "Endpoint: %u\n"
+    "Manufacturer: %s\n"
+    "Model: %s\n"
+    "Last operation: %s\n",
+    ZIGBEE_ENDPOINT,
+    ZIGBEE_MANUFACTURER,
+    getZigbeeModelName(),
+    zigbeeLastOperation.c_str()
+  );
+
+  if (zigbeeHasLastResult) {
+    Serial.printf(
+      "Last result: %s\n",
+      esp_err_to_name(zigbeeLastResult)
+    );
+  } else {
+    Serial.println("Last result: none");
+  }
+
+  Serial.printf(
+    "Reboot required: %s\n",
+    zigbeeRebootRequired ? "yes" : "no"
+  );
+
+  if (zigbeeProfile == ZigbeeProfile::LIGHT) {
+    Serial.printf(
+      "Light state: %s\n"
+      "LED pin: %u\n"
+      "LED active low: %s\n"
+      "Last state source: %s\n",
+      zigbeeLightState ? "ON" : "OFF",
+      ZIGBEE_LIGHT_LED_PIN,
+      ZIGBEE_LIGHT_LED_ACTIVE_LOW ? "yes" : "no",
+      getLightStateSourceName()
+    );
+  } else {
+    printSensorStatus();
+  }
+}
+
+void serviceZigbee() {
+  if (
+    zigbeeFactoryResetPending &&
+    static_cast<int32_t>(
+      millis() - zigbeeFactoryResetDeadline
+    ) >= 0
+  ) {
+    zigbeeFactoryResetPending = false;
+    zigbeeFactoryResetDeadline = 0;
+    Serial.println();
+    Serial.println("Zigbee factory-reset confirmation expired.");
+    printPrompt();
+  }
+
+  if (
+    zigbeeStackStarted &&
+    !zigbeeRebootRequired
+  ) {
+    const bool connected =
+      Zigbee.connected() &&
+      esp_zb_bdb_dev_joined();
+
+    if (connected && !zigbeeJoined) {
+      announceZigbeeJoined();
+      printPrompt();
+    } else if (!connected && zigbeeJoined) {
+      zigbeeJoined = false;
+      zigbeeJoining = true;
+      zigbeeLastOperation = "network connection lost";
+      Serial.println();
+      Serial.println(
+        "Zigbee connection lost; network steering is active."
+      );
+      printPrompt();
+    }
+  }
+
+  serviceSensorReporting();
 }
 
 void printPrompt() {
@@ -972,10 +1589,10 @@ void stopPortal() {
 
 void stopAll() {
   if (zigbeeStackStarted) {
-    stopZigbeeTraffic();
-    currentMode = Mode::ZIGBEE_LAB;
+    stopSensorReporting();
+    currentMode = Mode::ZIGBEE_DEVICE;
     Serial.println(
-      "Zigbee stack remains active. Reboot to release the radio."
+      "Zigbee is active. Leave the network and reboot before using Wi-Fi or BLE."
     );
     return;
   }
@@ -1692,8 +2309,9 @@ void startPortal(
       .c_str()
   );
 
-  Serial.println(
-    "Training username: student"
+  Serial.printf(
+    "Training username: %s\n",
+    DEMO_USERNAME
   );
 
   Serial.println(
@@ -1799,18 +2417,22 @@ void printHelp() {
 
   Serial.println();
   Serial.println("Zigbee (ESP32-C6):");
-  Serial.println(
-    "  zigbee start [seconds]"
-  );
-  Serial.println(
-    "  zigbee send"
-  );
-  Serial.println(
-    "  zigbee stop"
-  );
-  Serial.println(
-    "  zigbee status"
-  );
+  Serial.println("  zigbee profile");
+  Serial.println("  zigbee profile sensor");
+  Serial.println("  zigbee profile light");
+  Serial.println("  zigbee join");
+  Serial.println("  zigbee leave");
+  Serial.println("  zigbee status");
+  Serial.println("  zigbee factory-reset");
+  Serial.println("  confirm zigbee factory-reset");
+  Serial.println("  zigbee light on|off|toggle|status");
+  Serial.println("  zigbee sensor value <temperature>");
+  Serial.println("  zigbee sensor send");
+  Serial.println("  zigbee sensor interval <milliseconds>");
+  Serial.println("  zigbee sensor start [seconds]");
+  Serial.println("  zigbee sensor stop");
+  Serial.println("  zigbee sensor status");
+  Serial.println("  aliases: zigbee start, zigbee send, zigbee stop");
 }
 
 // ============================================================
@@ -1820,7 +2442,7 @@ void printHelp() {
 void handleCommand(
   String command
 ) {
-  command.trim();
+  command = normalizeCommandWhitespace(command);
 
   if (command.length() == 0) {
     return;
@@ -1833,13 +2455,12 @@ void handleCommand(
     command != "status" &&
     command != "stop" &&
     command != "reboot" &&
-    command != "zigbee send" &&
-    command != "zigbee stop" &&
-    command != "zigbee status" &&
-    !command.startsWith("zigbee start")
+    !command.startsWith("zigbee ") &&
+    command != "zigbee" &&
+    command != "confirm zigbee factory-reset"
   ) {
     Serial.println(
-      "Zigbee owns the radio. Reboot before using Wi-Fi or BLE."
+      "Zigbee is active. Leave the network and reboot before using Wi-Fi or BLE."
     );
     return;
   }
@@ -1853,16 +2474,16 @@ void handleCommand(
       "Firmware: WirelessLab32-C6\n"
       "Version: %s\n"
       "Chip: %s rev %u\n"
-      "CPU: %u MHz\n"
-      "Flash: %u bytes\n"
-      "Free heap: %u bytes\n"
+      "CPU: %lu MHz\n"
+      "Flash: %lu bytes\n"
+      "Free heap: %lu bytes\n"
       "Mode: %s\n",
       FW_VERSION,
       ESP.getChipModel(),
       ESP.getChipRevision(),
-      ESP.getCpuFreqMHz(),
-      ESP.getFlashChipSize(),
-      ESP.getFreeHeap(),
+      static_cast<unsigned long>(ESP.getCpuFreqMHz()),
+      static_cast<unsigned long>(ESP.getFlashChipSize()),
+      static_cast<unsigned long>(ESP.getFreeHeap()),
       getModeName().c_str()
     );
   }
@@ -1873,8 +2494,7 @@ void handleCommand(
       "BLE initialized: %s\n"
       "BLE advertising: %s\n"
       "Portal: %s\n"
-      "Zigbee stack: %s\n"
-      "Zigbee traffic: %s\n",
+      "Zigbee stack: %s\n",
       getModeName().c_str(),
       bleInitialized
         ? "yes"
@@ -1886,12 +2506,11 @@ void handleCommand(
         ? "active"
         : "inactive",
       zigbeeStackStarted
-        ? "active on channel 15"
-        : "inactive",
-      zigbeeTrafficActive
         ? "active"
         : "inactive"
     );
+
+    printZigbeeStatus();
   }
 
   else if (command == "stop") {
@@ -1907,52 +2526,338 @@ void handleCommand(
     ESP.restart();
   }
 
-  else if (
-    command.startsWith("zigbee start")
-  ) {
-    String argument =
-      command.substring(
-        String("zigbee start").length()
-      );
-    argument.trim();
-
-    int requestedSeconds =
-      argument.length() ? argument.toInt() : 10;
-
-    if (
-      requestedSeconds <= 0 ||
-      requestedSeconds > MAX_ZIGBEE_LAB_DURATION_SECONDS
-    ) {
-      requestedSeconds = MAX_ZIGBEE_LAB_DURATION_SECONDS;
-    }
-
-    startZigbeeTraffic(
-      static_cast<uint8_t>(requestedSeconds)
+  else if (command == "zigbee profile") {
+    Serial.printf(
+      "Selected Zigbee profile: %s\n",
+      getZigbeeProfileName()
+    );
+    Serial.println(
+      "Select the profile before running: zigbee join"
     );
   }
 
-  else if (command == "zigbee send") {
-    if (!startZigbeeStack()) {
-      return;
-    }
+  else if (
+    command == "zigbee profile sensor" ||
+    command == "zigbee profile light"
+  ) {
+    if (zigbeeStackStarted) {
+      Serial.println(
+        "Zigbee profile cannot be changed after the stack starts. Factory reset and reboot first."
+      );
+    } else {
+      zigbeeProfile =
+        command.endsWith("light")
+          ? ZigbeeProfile::LIGHT
+          : ZigbeeProfile::SENSOR;
 
-    sendZigbeeDummyPacket();
+      Serial.printf(
+        "Selected Zigbee profile: %s\n",
+        getZigbeeProfileName()
+      );
+      Serial.println("Next command: zigbee join");
+    }
   }
 
-  else if (command == "zigbee stop") {
-    stopZigbeeTraffic();
+  else if (
+    command.startsWith("zigbee profile ")
+  ) {
+    Serial.println(
+      "Usage: zigbee profile [sensor|light]"
+    );
+  }
+
+  else if (
+    command == "zigbee join" ||
+    command == "zigbee start"
+  ) {
+    handleZigbeeJoin();
+  }
+
+  else if (
+    command.startsWith("zigbee join ") ||
+    command.startsWith("zigbee start ")
+  ) {
+    Serial.println("Usage: zigbee join");
+  }
+
+  else if (command == "zigbee leave") {
+    requestZigbeeLeave();
+  }
+
+  else if (command == "zigbee factory-reset") {
+    zigbeeFactoryResetPending = true;
+    zigbeeFactoryResetDeadline =
+      millis() + ZIGBEE_FACTORY_RESET_CONFIRMATION_MS;
+
+    Serial.println(
+      "Zigbee factory reset requested."
+    );
+    Serial.println(
+      "Confirm within 15 seconds with:"
+    );
+    Serial.println(
+      "confirm zigbee factory-reset"
+    );
+  }
+
+  else if (
+    command == "confirm zigbee factory-reset"
+  ) {
+    if (
+      !zigbeeFactoryResetPending ||
+      static_cast<int32_t>(
+        millis() - zigbeeFactoryResetDeadline
+      ) >= 0
+    ) {
+      zigbeeFactoryResetPending = false;
+      Serial.println(
+        "No active Zigbee factory-reset confirmation."
+      );
+    } else {
+      requestZigbeeFactoryReset();
+    }
   }
 
   else if (command == "zigbee status") {
-    Serial.printf(
-      "Stack: %s\n"
-      "Traffic: %s\n"
-      "Channel: %u\n"
-      "Packets requested: %lu\n",
-      zigbeeStackStarted ? "active" : "inactive",
-      zigbeeTrafficActive ? "active" : "inactive",
-      ZIGBEE_LAB_CHANNEL,
-      static_cast<unsigned long>(zigbeePacketCounter)
+    printZigbeeStatus();
+  }
+
+  else if (
+    command == "zigbee light on" ||
+    command == "zigbee light off" ||
+    command == "zigbee light toggle"
+  ) {
+    if (zigbeeProfile != ZigbeeProfile::LIGHT) {
+      Serial.println(
+        "Zigbee LIGHT command rejected: selected profile is SENSOR."
+      );
+    } else {
+      bool requestedState = zigbeeLightState;
+
+      if (command.endsWith(" on")) {
+        requestedState = true;
+      } else if (command.endsWith(" off")) {
+        requestedState = false;
+      } else {
+        requestedState = !zigbeeLightState;
+      }
+
+      setZigbeeLightState(
+        requestedState,
+        ZigbeeLightStateSource::SERIAL
+      );
+    }
+  }
+
+  else if (command == "zigbee light status") {
+    if (zigbeeProfile != ZigbeeProfile::LIGHT) {
+      Serial.println(
+        "Zigbee LIGHT command rejected: selected profile is SENSOR."
+      );
+    } else {
+      Serial.printf(
+        "Light state: %s\n"
+        "Last state source: %s\n",
+        zigbeeLightState ? "ON" : "OFF",
+        getLightStateSourceName()
+      );
+    }
+  }
+
+  else if (command.startsWith("zigbee light")) {
+    Serial.println(
+      "Usage: zigbee light on|off|toggle|status"
+    );
+  }
+
+  else if (
+    command.startsWith("zigbee sensor value ")
+  ) {
+    if (zigbeeProfile != ZigbeeProfile::SENSOR) {
+      Serial.println(
+        "Zigbee SENSOR command rejected: selected profile is LIGHT."
+      );
+    } else {
+      const String argument =
+        command.substring(
+          String("zigbee sensor value ").length()
+        );
+      float temperature = 0.0f;
+
+      if (
+        !parseStrictFloat(argument, temperature) ||
+        temperature < -40.0f ||
+        temperature > 125.0f
+      ) {
+        Serial.println(
+          "Temperature must be a decimal value from -40.00 to 125.00 C."
+        );
+      } else {
+        zigbeeSensorCentiCelsius =
+          static_cast<int16_t>(
+            lroundf(temperature * 100.0f)
+          );
+
+        Serial.printf(
+          "Simulated sensor value: %.2f C\n",
+          zigbeeSensorCentiCelsius / 100.0f
+        );
+      }
+    }
+  }
+
+  else if (command == "zigbee sensor value") {
+    Serial.println(
+      "Usage: zigbee sensor value <temperature>"
+    );
+  }
+
+  else if (
+    command == "zigbee sensor send" ||
+    (
+      command == "zigbee send" &&
+      zigbeeProfile == ZigbeeProfile::SENSOR
+    )
+  ) {
+    sendSensorReport();
+  }
+
+  else if (
+    command.startsWith("zigbee sensor interval ")
+  ) {
+    if (zigbeeProfile != ZigbeeProfile::SENSOR) {
+      Serial.println(
+        "Zigbee SENSOR command rejected: selected profile is LIGHT."
+      );
+    } else {
+      const String argument =
+        command.substring(
+          String("zigbee sensor interval ").length()
+        );
+      long interval = 0;
+
+      if (
+        !parseStrictLong(argument, interval) ||
+        interval < static_cast<long>(
+          ZIGBEE_SENSOR_MIN_INTERVAL_MS
+        ) ||
+        interval > static_cast<long>(
+          ZIGBEE_SENSOR_MAX_INTERVAL_MS
+        )
+      ) {
+        Serial.println(
+          "Interval must be an integer from 500 to 60000 ms."
+        );
+      } else {
+        zigbeeSensorIntervalMs =
+          static_cast<uint32_t>(interval);
+
+        Serial.printf(
+          "Sensor report interval: %lu ms\n",
+          static_cast<unsigned long>(
+            zigbeeSensorIntervalMs
+          )
+        );
+      }
+    }
+  }
+
+  else if (command == "zigbee sensor interval") {
+    Serial.println(
+      "Usage: zigbee sensor interval <milliseconds>"
+    );
+  }
+
+  else if (
+    command == "zigbee sensor start" ||
+    command.startsWith("zigbee sensor start ")
+  ) {
+    String argument =
+      command.substring(
+        String("zigbee sensor start").length()
+      );
+    argument.trim();
+    long seconds = 10;
+
+    if (
+      (
+        argument.length() > 0 &&
+        !parseStrictLong(argument, seconds)
+      ) ||
+      seconds < 1 ||
+      seconds >
+        MAX_ZIGBEE_REPORTING_DURATION_SECONDS
+    ) {
+      Serial.println(
+        "Duration must be an integer from 1 to 60 seconds."
+      );
+    } else {
+      startSensorReporting(
+        static_cast<uint8_t>(seconds)
+      );
+    }
+  }
+
+  else if (
+    command == "zigbee sensor stop" ||
+    (
+      command == "zigbee stop" &&
+      zigbeeProfile == ZigbeeProfile::SENSOR
+    )
+  ) {
+    if (zigbeeProfile != ZigbeeProfile::SENSOR) {
+      Serial.println(
+        "Zigbee SENSOR command rejected: selected profile is LIGHT."
+      );
+    } else {
+      stopSensorReporting();
+    }
+  }
+
+  else if (command == "zigbee sensor status") {
+    if (zigbeeProfile != ZigbeeProfile::SENSOR) {
+      Serial.println(
+        "Zigbee SENSOR command rejected: selected profile is LIGHT."
+      );
+    } else {
+      printSensorStatus();
+    }
+  }
+
+  else if (
+    command == "zigbee send" &&
+    zigbeeProfile == ZigbeeProfile::LIGHT
+  ) {
+    if (!zigbeeJoined || zigbeeLightEndpoint == nullptr) {
+      Serial.println(
+        "Cannot synchronize light state: Zigbee device is not joined."
+      );
+    } else {
+      setZigbeeLightState(
+        zigbeeLightState,
+        ZigbeeLightStateSource::SERIAL
+      );
+    }
+  }
+
+  else if (
+    command == "zigbee stop" &&
+    zigbeeProfile == ZigbeeProfile::LIGHT
+  ) {
+    Serial.println(
+      "LIGHT has no periodic reporting to stop. Use 'zigbee leave' to leave the network."
+    );
+  }
+
+  else if (command.startsWith("zigbee sensor")) {
+    Serial.println(
+      "Usage: zigbee sensor value|send|interval|start|stop|status"
+    );
+  }
+
+  else if (command.startsWith("zigbee")) {
+    Serial.println(
+      "Unknown Zigbee command. Type: help"
     );
   }
 
@@ -2354,6 +3259,8 @@ void setup() {
   esp_rom_printf("\n[BOOT] WirelessLab32-C6 entered setup()\n");
 
   Serial.begin(115200);
+  pinMode(ZIGBEE_LIGHT_LED_PIN, OUTPUT);
+  applyLightLedState(false);
 
   esp_rom_printf("[BOOT] Serial initialized; waiting 500 ms\n");
   delay(500);
@@ -2378,7 +3285,7 @@ void loop() {
   serviceSerial();
   serviceBeaconLab();
   serviceBleAdvertisingLab();
-  serviceZigbeeTraffic();
+  serviceZigbee();
 
   if (
     currentMode ==

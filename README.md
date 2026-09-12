@@ -24,7 +24,7 @@ variantes separadas para el ESP32 clásico y el ESP32-C6.
 - Requiere Arduino-ESP32 3.3.8 o posterior.
 - Usa Wi-Fi 6 de 2.4 GHz y Bluetooth Low Energy; el C6 no ofrece Bluetooth
   Classic.
-- Incluye radio IEEE 802.15.4 y un laboratorio Zigbee coordinador en canal 15.
+- Incluye radio IEEE 802.15.4 y dos perfiles Zigbee End Device para ZHA.
 - La variante incluye los ajustes de API BLE 3.x y una guarda de compilación
   para impedir seleccionar accidentalmente otro SoC.
 - Compilación verificada con Arduino-ESP32 3.3.8 y el toolchain RISC-V oficial.
@@ -71,12 +71,36 @@ paquetes diseñados para provocar pop-ups no solicitados.
 
 ### Zigbee (solo ESP32-C6)
 
-- Crea una red Zigbee de laboratorio como coordinador en el canal fijo 15.
-- Publica reportes ZCL válidos de una entrada analógica ficticia una vez por
-  segundo, útiles para practicar captura y análisis.
-- Cada ejecución dura como máximo 60 segundos y puede detenerse antes.
-- Los paquetes se envían por broadcast a dispositivos con el receptor activo;
-  no controlan dispositivos ni intentan unirse a redes ajenas.
+- Se une como End Device a una red existente; nunca crea una red propia.
+- Perfil `LIGHT`: endpoint On/Off Light estándar controlable desde ZHA.
+- Perfil `SENSOR`: endpoint Temperature Measurement estándar con valores
+  simulados y reportes manuales o periódicos.
+- El CC2652P administrado por ZHA es el único coordinador Zigbee.
+
+## Zigbee lab architecture
+
+```text
+Home Assistant VM
+└── ZHA
+    └── CC2652P USB coordinator
+        └── ESP32-C6 Zigbee End Device
+            ├── Light profile
+            └── Sensor profile
+
+CC2531 USB dongle
+└── Passive sniffer
+    └── Wireshark
+```
+
+El CC2531 es únicamente un sniffer pasivo. No coordina la red ni participa en
+el joining. Antes de ejecutar `zigbee join`, abre en Home Assistant:
+
+```text
+Settings
+→ Devices & services
+→ Zigbee Home Automation
+→ Add device
+```
 
 ## Compilación con Arduino IDE
 
@@ -124,8 +148,8 @@ por ahora Arduino IDE con el core oficial 3.3.8 o posterior.
    Board: ESP32C6 Dev Module
    Flash Size: 4 MB
    Partition Scheme: Custom
-   Zigbee Mode: Zigbee ZCZR (coordinator/router)
-   USB CDC On Boot: Enabled
+   Zigbee Mode: Zigbee ED (end device)
+   USB CDC On Boot: Disabled
    Upload Speed: 460800
    Monitor Speed: 115200
    ```
@@ -136,11 +160,11 @@ El sketch incluye `WirelessLab_ESP32_C6/partitions.csv`: una tabla local para
 flash de 4 MB con una aplicación grande y las particiones de almacenamiento
 Zigbee. No incluye OTA.
 
-Tamaño verificado con core 3.3.8 y Zigbee habilitado:
+Tamaño verificado con core 3.3.8 y Zigbee ED habilitado:
 
 ```text
-Programa: 1,814,138 bytes
-RAM global: 64,280 bytes (19%)
+Programa: 1,742,088 bytes
+RAM global: 60,736 bytes (18%)
 ```
 
 ## Comandos
@@ -155,9 +179,9 @@ stop
 reboot
 ```
 
-`stop` detiene el portal, beacon lab, escaneo y advertising activos, y regresa a
-modo `IDLE`. Después de iniciar Zigbee, `stop` detiene los reportes dummy, pero
-la pila Zigbee conserva la radio hasta ejecutar `reboot`.
+`stop` detiene el portal, beacon lab, escaneo y advertising activos. Después de
+iniciar Zigbee, detiene solamente el reporting automático del sensor; la pila y
+la asociación permanecen activas hasta abandonar la red y reiniciar.
 
 ### Wi-Fi
 
@@ -214,23 +238,67 @@ ble exit
 ### Zigbee (ESP32-C6)
 
 ```text
-zigbee start [seconds]
-zigbee send
+zigbee profile
+zigbee profile sensor
+zigbee profile light
+zigbee join
+zigbee leave
 zigbee status
+zigbee factory-reset
+confirm zigbee factory-reset
+
+zigbee light on
+zigbee light off
+zigbee light toggle
+zigbee light status
+
+zigbee sensor value <temperature>
+zigbee sensor send
+zigbee sensor interval <milliseconds>
+zigbee sensor start [seconds]
+zigbee sensor stop
+zigbee sensor status
+
+zigbee start
+zigbee send
 zigbee stop
 ```
 
-Ejemplo para generar 30 reportes dummy en el canal 15:
+El perfil vuelve a `SENSOR` después de cada reinicio y debe seleccionarse antes
+de `zigbee join`. `zigbee start` se conserva como alias de `zigbee join`.
+
+Flujo LIGHT:
 
 ```text
-zigbee start 30
+zigbee profile light
 zigbee status
-zigbee stop
+zigbee join
+zigbee light toggle
 ```
 
-`zigbee send` solicita un solo reporte. La primera orden Zigbee crea la red y
-puede tardar varios segundos. Una vez iniciada la pila, reinicia el C6 antes de
-volver a utilizar los módulos Wi-Fi o BLE.
+Flujo SENSOR:
+
+```text
+zigbee profile sensor
+zigbee sensor value 23.50
+zigbee join
+zigbee sensor send
+zigbee sensor interval 2000
+zigbee sensor start 30
+```
+
+El reporting acepta intervalos de 500 a 60000 ms y dura como máximo 60
+segundos. Para cambiar de perfil después de haber iniciado la pila:
+
+```text
+zigbee factory-reset
+confirm zigbee factory-reset
+reboot
+```
+
+La confirmación expira en 15 segundos y borra únicamente el almacenamiento
+Zigbee. No se muestran ni administran manualmente Network Keys, install codes o
+claves del Trust Center.
 
 ## Primera prueba BLE
 
@@ -302,6 +370,7 @@ portal stop
 │   └── WirelessLab_ESP32.ino
 ├── WirelessLab_ESP32_C6/
 │   ├── WirelessLab_ESP32_C6.ino
+│   ├── partitions.csv
 │   └── README.md
 ├── platformio.ini
 └── README.md
